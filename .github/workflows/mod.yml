@@ -1,0 +1,85 @@
+name: Build mod Gitbox
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mod:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Escribir el mod
+        run: |
+          mkdir mod && cd mod
+          cat > crew_mod_api.h <<'EOF'
+          #pragma once
+          #include <jni.h>
+          #include <stdint.h>
+          #define CREW_API_VERSION 1
+          typedef struct CrewApi {
+              uint32_t version;
+              JavaVM* vm;
+              void (*log)(int priority, const char* tag, const char* message);
+          } CrewApi;
+          #define CREW_MOD_ENTRY extern "C" __attribute__((visibility("default"))) void crew_mod_init(const CrewApi* api)
+          EOF
+          cat > mod.cpp <<'EOF'
+          #include <android/log.h>
+          #include <jni.h>
+          #include "crew_mod_api.h"
+
+          static void toast(JavaVM* vm, const char* text) {
+              JNIEnv* env = nullptr;
+              if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return;
+              jclass looper = env->FindClass("android/os/Looper");
+              jmethodID myLooper = looper ? env->GetStaticMethodID(looper, "myLooper", "()Landroid/os/Looper;") : nullptr;
+              jobject l = myLooper ? env->CallStaticObjectMethod(looper, myLooper) : nullptr;
+              if (!l) { env->ExceptionClear(); return; }
+              jclass at = env->FindClass("android/app/ActivityThread");
+              jmethodID cur = at ? env->GetStaticMethodID(at, "currentApplication", "()Landroid/app/Application;") : nullptr;
+              jobject app = cur ? env->CallStaticObjectMethod(at, cur) : nullptr;
+              jclass tc = env->FindClass("android/widget/Toast");
+              jmethodID mk = tc ? env->GetStaticMethodID(tc, "makeText", "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;") : nullptr;
+              if (!app || !mk) { env->ExceptionClear(); return; }
+              jobject t = env->CallStaticObjectMethod(tc, mk, app, env->NewStringUTF(text), 1);
+              jmethodID show = t ? env->GetMethodID(tc, "show", "()V") : nullptr;
+              if (show) env->CallVoidMethod(t, show);
+              if (env->ExceptionCheck()) env->ExceptionClear();
+          }
+
+          CREW_MOD_ENTRY {
+              api->log(ANDROID_LOG_INFO, "GitboxTest", "Gitbox Test cargado correctamente");
+              toast(api->vm, "Gitbox Test: mod cargado");
+          }
+          EOF
+          echo '{"id":"test.gitbox","name":"Gitbox Test","version":"1.0.0","author":"tú"}' > mod.json
+
+      - name: Compilar
+        run: |
+          cd mod
+          NDK=${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}
+          BIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          mkdir -p out/arm64-v8a out/armeabi-v7a
+          $BIN/aarch64-linux-android28-clang++ -shared -fPIC -O2 -nostdlib++ -Wl,-z,max-page-size=16384 mod.cpp -o out/arm64-v8a/libgitbox.so -llog
+          $BIN/armv7a-linux-androideabi28-clang++ -shared -fPIC -O2 -nostdlib++ mod.cpp -o out/armeabi-v7a/libgitbox.so -llog
+
+      - name: Empaquetar .crewag
+        run: |
+          cd mod
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile("gitbox.crewag", "w", zipfile.ZIP_DEFLATED) as z:
+              z.write("mod.json", "mod.json")
+              z.write("out/arm64-v8a/libgitbox.so", "lib/arm64-v8a/libgitbox.so")
+              z.write("out/armeabi-v7a/libgitbox.so", "lib/armeabi-v7a/libgitbox.so")
+          PY
+
+      - name: Publicar en Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gitbox-${{ github.run_number }}
+          name: Gitbox Test ${{ github.run_number }}
+          files: mod/gitbox.crewag
