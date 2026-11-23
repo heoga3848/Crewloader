@@ -1,0 +1,327 @@
+name: Build mod Diag
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mod:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Escribir el mod
+        run: |
+          mkdir mod && cd mod
+          cat > crew_mod_api.h <<'EOF'
+          #pragma once
+          #include <jni.h>
+          #include <stdint.h>
+          #define CREW_API_VERSION 1
+          typedef struct CrewApi {
+              uint32_t version;
+              JavaVM* vm;
+              void (*log)(int priority, const char* tag, const char* message);
+          } CrewApi;
+          #define CREW_MOD_ENTRY extern "C" __attribute__((visibility("default"))) void crew_mod_init(const CrewApi* api)
+          EOF
+          cat > mod.cpp <<'EOF'
+          #include <android/log.h>
+          #include <dlfcn.h>
+          #include <jni.h>
+          #include <pthread.h>
+          #include <stdarg.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/stat.h>
+          #include <unistd.h>
+          #include "crew_mod_api.h"
+
+          #define TAG "CrewDiag"
+          #define PKG "com.innersloth.spacemafia"
+
+          static JavaVM* g_vm;
+          static char g_buf[300000];
+          static size_t g_len;
+          static char g_path[512];
+
+          static void out(const char* fmt, ...) {
+              if (g_len + 1 >= sizeof(g_buf)) return;
+              va_list a;
+              va_start(a, fmt);
+              int n = vsnprintf(g_buf + g_len, sizeof(g_buf) - g_len, fmt, a);
+              va_end(a);
+              if (n < 0) return;
+              size_t room = sizeof(g_buf) - g_len - 1;
+              g_len += ((size_t)n < room) ? (size_t)n : room;
+          }
+
+          // ---- toast (hilo principal) ----
+          static void toast(const char* text) {
+              JNIEnv* env = nullptr;
+              if (!g_vm || g_vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return;
+              jclass lc = env->FindClass("android/os/Looper");
+              jmethodID gm = lc ? env->GetStaticMethodID(lc, "getMainLooper", "()Landroid/os/Looper;") : nullptr;
+              jobject ml = gm ? env->CallStaticObjectMethod(lc, gm) : nullptr;
+              jclass ac = env->FindClass("android/app/ActivityThread");
+              jmethodID ca = ac ? env->GetStaticMethodID(ac, "currentApplication", "()Landroid/app/Application;") : nullptr;
+              jobject app = ca ? env->CallStaticObjectMethod(ac, ca) : nullptr;
+              jclass tc = env->FindClass("android/widget/Toast");
+              jmethodID mk = tc ? env->GetStaticMethodID(tc, "makeText",
+                  "(Landroid/content/Context;Landroid/os/Looper;Ljava/lang/CharSequence;I)Landroid/widget/Toast;") : nullptr;
+              if (!ml || !app || !mk) { env->ExceptionClear(); return; }
+              jobject t = env->CallStaticObjectMethod(tc, mk, app, ml, env->NewStringUTF(text), 1);
+              jmethodID sh = t ? env->GetMethodID(tc, "show", "()V") : nullptr;
+              if (sh) env->CallVoidMethod(t, sh);
+              if (env->ExceptionCheck()) env->ExceptionClear();
+          }
+
+          // ---- archivo de salida ----
+          static void mkdirs(const char* path) {
+              char tmp[512];
+              snprintf(tmp, sizeof tmp, "%s", path);
+              for (char* p = tmp + 1; *p; p++) {
+                  if (*p == '/') { *p = 0; mkdir(tmp, 0775); *p = '/'; }
+              }
+              mkdir(tmp, 0775);
+          }
+
+          static void write_file() {
+              const char* dirs[] = {
+                  "/storage/emulated/0/Android/media/" PKG,
+                  "/storage/emulated/0/Android/data/" PKG "/files",
+                  "/data/data/" PKG "/files"};
+              for (int i = 0; i < 3; i++) {
+                  mkdirs(dirs[i]);
+                  char p[600];
+                  snprintf(p, sizeof p, "%s/crew_diag.txt", dirs[i]);
+                  FILE* f = fopen(p, "w");
+                  if (!f) continue;
+                  fwrite(g_buf, 1, g_len, f);
+                  fclose(f);
+                  snprintf(g_path, sizeof g_path, "%s", p);
+                  break;
+              }
+              // copia en logcat
+              size_t pos = 0;
+              while (pos < g_len) {
+                  char line[900];
+                  size_t k = 0;
+                  while (pos < g_len && g_buf[pos] != '\n' && k < sizeof(line) - 1) line[k++] = g_buf[pos++];
+                  if (pos < g_len && g_buf[pos] == '\n') pos++;
+                  line[k] = 0;
+                  __android_log_write(ANDROID_LOG_INFO, TAG, line);
+              }
+          }
+
+          static void finish(const char* msg) {
+              write_file();
+              char m[800];
+              snprintf(m, sizeof m, "%s\n%s", msg, g_path[0] ? g_path : "(no pude guardar el archivo)");
+              toast(m);
+          }
+
+          // ---- API il2cpp (se busca con dlsym) ----
+          typedef void* (*t_domain_get)();
+          typedef void* (*t_thread_attach)(void*);
+          typedef void** (*t_get_assemblies)(void*, size_t*);
+          typedef void* (*t_ptr1)(void*);
+          typedef const char* (*t_str1)(void*);
+          typedef void* (*t_class_from_name)(void*, const char*, const char*);
+          typedef void* (*t_iter)(void*, void**);
+          typedef char* (*t_type_name)(void*);
+          typedef size_t (*t_size1)(void*);
+          typedef void* (*t_image_class)(void*, size_t);
+
+          static t_domain_get f_domain_get;
+          static t_thread_attach f_thread_attach;
+          static t_get_assemblies f_get_assemblies;
+          static t_ptr1 f_asm_image, f_parent, f_field_type;
+          static t_str1 f_image_name, f_class_name, f_class_ns, f_field_name, f_method_name;
+          static t_class_from_name f_class_from_name;
+          static t_iter f_fields, f_methods;
+          static t_type_name f_type_name;
+          static t_size1 f_field_offset, f_img_class_count;
+          static t_image_class f_img_class;
+
+          static void* sym(void* h, const char* n) {
+              char b[96];
+              snprintf(b, sizeof b, "il2cpp_%s", n);
+              void* p = dlsym(h, b);
+              if (!p) out("falta il2cpp_%s\n", n);
+              return p;
+          }
+
+          static bool dump_class(void* img, const char* ns, const char* name) {
+              void* k = f_class_from_name(img, ns, name);
+              if (!k) { out("[%s] NO encontrada\n", name); return false; }
+              out("[%s] encontrada\n", name);
+              if (f_parent && f_class_name) {
+                  void* p = f_parent(k);
+                  for (int d = 0; p && d < 6; d++) { out("  hereda de: %s\n", f_class_name(p)); p = f_parent(p); }
+              }
+              if (f_fields && f_field_name) {
+                  void* it = nullptr; void* f; int n = 0;
+                  while ((f = f_fields(k, &it)) && n++ < 200) {
+                      char* tn = (f_field_type && f_type_name) ? f_type_name(f_field_type(f)) : nullptr;
+                      out("  campo %s : %s @0x%zx\n", f_field_name(f), tn ? tn : "?",
+                          f_field_offset ? f_field_offset(f) : (size_t)0);
+                  }
+              }
+              if (f_methods && f_method_name) {
+                  void* it = nullptr; void* m; int n = 0;
+                  while ((m = f_methods(k, &it)) && n++ < 300) out("  metodo %s\n", f_method_name(m));
+              }
+              return true;
+          }
+
+          static void scan_classes(void* img) {
+              if (!f_img_class_count || !f_img_class || !f_class_name) return;
+              size_t cnt = f_img_class_count(img);
+              out("Assembly-CSharp tiene %zu clases. Relacionadas:\n", cnt);
+              const char* kw[] = {"Collider", "Hitbox", "Physics", "Wall", "Vent", "Shadow", "Mover", "Console"};
+              int shown = 0;
+              for (size_t i = 0; i < cnt && shown < 250; i++) {
+                  void* k = f_img_class(img, i);
+                  const char* n = k ? f_class_name(k) : nullptr;
+                  if (!n) continue;
+                  for (int j = 0; j < 8; j++) {
+                      if (strstr(n, kw[j])) {
+                          out("  clase %s.%s\n", f_class_ns ? f_class_ns(k) : "", n);
+                          shown++;
+                          break;
+                      }
+                  }
+              }
+          }
+
+          static void check_unity(void** asms, size_t n) {
+              const char* want[][2] = {
+                  {"UnityEngine", "LineRenderer"}, {"UnityEngine", "Collider2D"},
+                  {"UnityEngine", "BoxCollider2D"}, {"UnityEngine", "CircleCollider2D"},
+                  {"UnityEngine", "CapsuleCollider2D"}, {"UnityEngine", "PolygonCollider2D"},
+                  {"UnityEngine", "Physics2D"}, {"UnityEngine", "GL"}, {"UnityEngine", "Camera"},
+                  {"UnityEngine", "Material"}, {"UnityEngine", "Shader"}, {"UnityEngine", "GameObject"}};
+              for (int w = 0; w < 12; w++) {
+                  bool found = false;
+                  for (size_t i = 0; i < n && !found; i++) {
+                      void* img = f_asm_image(asms[i]);
+                      if (f_class_from_name(img, want[w][0], want[w][1])) {
+                          out("[%s.%s] en %s\n", want[w][0], want[w][1], f_image_name(img));
+                          found = true;
+                      }
+                  }
+                  if (!found) out("[%s.%s] NO encontrada\n", want[w][0], want[w][1]);
+              }
+          }
+
+          static void* worker(void*) {
+              JNIEnv* env = nullptr;
+              g_vm->AttachCurrentThread(&env, nullptr);
+              toast("Gitbox Diag: cargado, esperando al juego...");
+
+              void* h = nullptr;
+              for (int i = 0; i < 120 && !h; i++) {
+                  h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+                  if (!h) sleep(1);
+              }
+              if (!h) { out("libil2cpp.so no se cargo\n"); finish("Diag: no encontre libil2cpp.so"); return nullptr; }
+
+              f_domain_get = (t_domain_get)sym(h, "domain_get");
+              f_thread_attach = (t_thread_attach)sym(h, "thread_attach");
+              f_get_assemblies = (t_get_assemblies)sym(h, "domain_get_assemblies");
+              f_asm_image = (t_ptr1)sym(h, "assembly_get_image");
+              f_image_name = (t_str1)sym(h, "image_get_name");
+              f_class_from_name = (t_class_from_name)sym(h, "class_from_name");
+              f_class_name = (t_str1)sym(h, "class_get_name");
+              f_class_ns = (t_str1)sym(h, "class_get_namespace");
+              f_parent = (t_ptr1)sym(h, "class_get_parent");
+              f_fields = (t_iter)sym(h, "class_get_fields");
+              f_field_name = (t_str1)sym(h, "field_get_name");
+              f_field_type = (t_ptr1)sym(h, "field_get_type");
+              f_type_name = (t_type_name)sym(h, "type_get_name");
+              f_field_offset = (t_size1)sym(h, "field_get_offset");
+              f_methods = (t_iter)sym(h, "class_get_methods");
+              f_method_name = (t_str1)sym(h, "method_get_name");
+              f_img_class_count = (t_size1)sym(h, "image_get_class_count");
+              f_img_class = (t_image_class)sym(h, "image_get_class");
+
+              if (!f_domain_get || !f_thread_attach || !f_get_assemblies || !f_asm_image ||
+                  !f_image_name || !f_class_from_name) {
+                  finish("Diag: il2cpp no exporta su API");
+                  return nullptr;
+              }
+
+              void* domain = nullptr;
+              for (int i = 0; i < 180 && !domain; i++) { domain = f_domain_get(); if (!domain) sleep(1); }
+              if (!domain) { out("il2cpp no arranco\n"); finish("Diag: il2cpp no arranco"); return nullptr; }
+              f_thread_attach(domain);
+
+              void* csharp = nullptr;
+              void** asms = nullptr;
+              size_t n = 0;
+              for (int i = 0; i < 120 && !csharp; i++) {
+                  asms = f_get_assemblies(domain, &n);
+                  for (size_t j = 0; j < n && !csharp; j++) {
+                      void* img = f_asm_image(asms[j]);
+                      const char* nm = img ? f_image_name(img) : nullptr;
+                      if (nm && strstr(nm, "Assembly-CSharp")) csharp = img;
+                  }
+                  if (!csharp) sleep(1);
+              }
+              if (!csharp) { out("no aparecio Assembly-CSharp\n"); finish("Diag: no hay Assembly-CSharp"); return nullptr; }
+              sleep(3);
+              asms = f_get_assemblies(domain, &n);
+
+              out("== Ensamblados (%zu) ==\n", n);
+              for (size_t i = 0; i < n; i++) out("  %s\n", f_image_name(f_asm_image(asms[i])));
+              out("\n== Clases de Unity para dibujar ==\n");
+              check_unity(asms, n);
+              out("\n== Clases del juego ==\n");
+              scan_classes(csharp);
+              out("\n== Detalle ==\n");
+              bool pc = dump_class(csharp, "", "PlayerControl");
+              dump_class(csharp, "", "PlayerPhysics");
+              dump_class(csharp, "", "ShipStatus");
+
+              finish(pc ? "Gitbox Diag OK: PlayerControl encontrada" : "Gitbox Diag: PlayerControl NO encontrada");
+              g_vm->DetachCurrentThread();
+              return nullptr;
+          }
+
+          CREW_MOD_ENTRY {
+              g_vm = api->vm;
+              pthread_t t;
+              if (pthread_create(&t, nullptr, worker, nullptr) == 0) pthread_detach(t);
+          }
+          EOF
+          echo '{"id":"test.diag","name":"Gitbox Diag","version":"0.1.0","author":"tú"}' > mod.json
+
+      - name: Compilar
+        run: |
+          cd mod
+          NDK=${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}
+          BIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          mkdir -p out/arm64-v8a out/armeabi-v7a
+          FLAGS="-shared -fPIC -O2 -nostdlib++ -fno-exceptions -fno-rtti"
+          $BIN/aarch64-linux-android28-clang++ $FLAGS -Wl,-z,max-page-size=16384 mod.cpp -o out/arm64-v8a/libdiag.so -llog -ldl
+          $BIN/armv7a-linux-androideabi28-clang++ $FLAGS mod.cpp -o out/armeabi-v7a/libdiag.so -llog -ldl
+
+      - name: Empaquetar .crewag
+        run: |
+          cd mod
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile("diag.crewag", "w", zipfile.ZIP_DEFLATED) as z:
+              z.write("mod.json", "mod.json")
+              z.write("out/arm64-v8a/libdiag.so", "lib/arm64-v8a/libdiag.so")
+              z.write("out/armeabi-v7a/libdiag.so", "lib/armeabi-v7a/libdiag.so")
+          PY
+
+      - name: Publicar en Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: diag-${{ github.run_number }}
+          name: Gitbox Diag ${{ github.run_number }}
+          files: mod/diag.crewag
