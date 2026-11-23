@@ -1,0 +1,52 @@
+name: Build CrewLoader
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descomprimir proyecto
+        run: unzip -q CrewLoader.zip
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Instalar SDK / NDK / CMake
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+          build-root-directory: CrewLoader
+
+      - name: Compilar APK
+        working-directory: CrewLoader
+        run: gradle assembleDebug --no-daemon
+
+      - name: Renombrar APK
+        run: cp CrewLoader/app/build/outputs/apk/debug/app-debug.apk CrewLoader.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CrewLoader-apk
+          path: CrewLoader.apk
+
+      - name: Publicar en Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: CrewLoader v1.0.${{ github.run_number }}
+          files: CrewLoader.apk
